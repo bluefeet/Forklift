@@ -54,19 +54,20 @@ Available drivers include:
 =item *
 
 L<Forklift::Driver::Basic> - An in-process, blocking, driver.  Mostly useful for
-testing.  This is the default driver if none is specified.
+testing.  This is the default driver if the C<::Parallel::ForkManager> driver is
+not installed.
 
 =item *
 
 L<Forklift::Driver::Parallel::ForkManager> - This uses L<Parallel::ForkManager> to run
-jobs in parallel.
+jobs in parallel.  This is the default driver if it is installed.
 
 =back
 
 =head1 SCHEDULERS
 
 Schedulers decide when to run jobs.  When a job is created it is passed to a scheduler,
-who them decides to immediately pass the job to the driver, or defer it to later.
+who then decides to immediately pass the job to the driver, or defer it to later.
 
 Schedulers are configured by setting the L</scheduler> argument.
 
@@ -142,9 +143,16 @@ sub BUILD {
 An object which consumes the L<Forklift::Driver> role.  A hashref may be
 passed and will automatically be instantiated into a new object.  If the
 hashref has the C<class> key then that class will be used instead of
-C<Forklift::Driver::Basic>.
+the default.
+
+Defaults to L<Forklift::Driver::Parallel::ForkManager>, if installed, or
+L<Forklift::Driver::Basic>, if not.
 
 =cut
+
+my $default_driver = '::Basic';
+$default_driver = '::Parallel::ForkManager'
+    if eval { require Forklift::Driver::Parallel::ForkManager; 1 };
 
 has_pluggable_object driver => (
     isa             => ConsumerOf[ 'Forklift::Driver' ],
@@ -152,7 +160,7 @@ has_pluggable_object driver => (
     class_arg       => 1,
     args_builder    => 1,
     default         => sub{ {} },
-    default_class   => '::Basic',
+    default_class   => $default_driver,
 );
 sub _driver_build_args {
     my ($self, $args) = @_;

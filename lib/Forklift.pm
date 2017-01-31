@@ -15,6 +15,8 @@ Forklift - Simple parallel job processing.
     });
     
     $lift->do(
+        # job id
+        'foo-3',
         # job code ref
         sub{
             # do more stuff
@@ -29,7 +31,6 @@ Forklift - Simple parallel job processing.
     );
     
     $lift->wait(); # wait for all jobs to complete
-    $lift->throw(); # throw any exceptions caught while running the jobs
 
 =head1 DESCRIPTION
 
@@ -44,20 +45,21 @@ The common driver type is one who forks off a process, runs the job, and uses so
 sort of IPC to communicate the results back.  But, there is nothing about Forklift
 which actually limits the job running to forking.
 
+Drivers are configured by setting the L</driver> argument.
+
 Available drivers include:
 
 =over
 
 =item *
 
-L<Forklift::Driver::PFM> - This uses L<Parallel::ForkManager> to run jobs in
-parallel.  This is the default driver if none is specified.
+L<Forklift::Driver::Basic> - An in-process, blocking, driver.  Mostly useful for
+testing.  This is the default driver if none is specified.
 
 =item *
 
-L<Forklift::Driver::Basic> - An in-process, blocking, driver.  Mostly useful for
-testing.  Using this is effectively identical to using the C<::PFM> driver with
-C<max_workers> set to C<0>.
+L<Forklift::Driver::Parallel::ForkManager> - This uses L<Parallel::ForkManager> to run
+jobs in parallel.
 
 =back
 
@@ -65,6 +67,8 @@ C<max_workers> set to C<0>.
 
 Schedulers decide when to run jobs.  When a job is created it is passed to a scheduler,
 who them decides to immediately pass the job to the driver, or defer it to later.
+
+Schedulers are configured by setting the L</scheduler> argument.
 
 Available schedulers include:
 
@@ -82,6 +86,24 @@ and then sends the batch of jobs to the driver as one unit to process.
 
 =back
 
+=head1 PLUGINS
+
+Plugins extend the base functionality of Forklift and allow core changes to be made
+to it without bulking up the core distribution with optional dependencies.
+
+Plugins are set with the L</plugins> argument and are configured in whatever way
+the plugin documents its configuration.
+
+Available plugins include:
+
+=over
+
+=item *
+
+L<Forklift::Plugin::Log::Any> - Logs whenever jobs start and finish using L<Log::Any>.
+
+=back
+
 =cut
 
 use Types::Standard -types;
@@ -89,7 +111,7 @@ use Types::Common::String -types;
 
 use Forklift::Job;
 use Forklift::Result;
-use Forklift::Results;
+use Scalar::Util qw( weaken );
 
 use Moo;
 use strictures 2;
@@ -97,27 +119,30 @@ use namespace::clean;
 
 use MooX::PluginKit::Consumer;
 
-plugin_namespace 'ForkliftX';
+plugin_namespace 'Forklift::Plugin';
 
-#sub DEMOLISH {
-#    my ($self) = @_;
-#    $self->wait();
-#    return;
-#}
+sub BUILD {
+    my ($self) = @_;
+    $self->driver();
+    $self->scheduler();
+    $self->job_class();
+    $self->result_class();
+    return;
+}
 
 =head1 OPTIONAL ARGUMENTS
 
 =head2 driver
 
     driver => {
-        class => '::PFM',
+        class => '::Parallel::ForkManager',
         max_workers => 20,
     },
 
 An object which consumes the L<Forklift::Driver> role.  A hashref may be
 passed and will automatically be instantiated into a new object.  If the
 hashref has the C<class> key then that class will be used instead of
-C<Forklift::Driver::PFM>.
+C<Forklift::Driver::Basic>.
 
 =cut
 
@@ -127,11 +152,11 @@ has_pluggable_object driver => (
     class_arg       => 1,
     args_builder    => 1,
     default         => sub{ {} },
-    default_class   => '::PFM',
+    default_class   => '::Basic',
 );
 sub _driver_build_args {
     my ($self, $args) = @_;
-    $args->{results} = $self->results();
+    $args->{result_class} = $self->result_class();
     return $args;
 }
 
@@ -156,34 +181,31 @@ has_pluggable_object scheduler => (
     args_builder    => 1,
     default         => sub{ {} },
     default_class   => '::Basic',
+    handles         => [qw( schedule_job )],
 );
 sub _scheduler_build_args {
     my ($self, $args) = @_;
     $args->{driver} = $self->driver();
+    # Somehow this avoids leaks... not sure why.
+    # Maybe a bug in MooX::Pluginkit which is holding onto the args hash?
+    weaken $args->{driver};
     return $args;
 }
 
-=head2 results
+=head2 plugins
 
-An instance of L<Forklift::Results> or a subclass of it.  Contains the results
-of completed jobs.
+    plugins => ['::Log::Any'],
+
+An arrayref of plugin module names.  If any of the plugins start with C<::> they are
+assumed to be relative to the C<Forklift::Plugin::> namespace.
 
 =cut
 
-has_pluggable_object results => (
-    is              => 'ro',
-    class           => 'Forklift::Results',
-    class_arg       => 1,
-    args_builder    => 1,
-    default         => sub{ {} },
-);
-sub _results_build_args {
-    my ($self, $args) = @_;
-    $args->{result_class} = $self->result_class();
-    return $args;
-}
+# This argument comes from MooX::PluginKit.
 
 =head2 job_class
+
+    job_class => 'MyApp::CustomJob',
 
 The class to construct new job objects from.  Defaults to L<Forlift::Job>.
 
@@ -194,6 +216,8 @@ has_pluggable_class job_class => (
 );
 
 =head2 result_class
+
+    result_class => 'MyApp::CustomResult',
 
 The class to construct new result objects from.  Defaults to L<Forlift::Result>.
 
@@ -208,20 +232,37 @@ has_pluggable_class result_class => (
 =head2 do
 
     $lift->do( sub{ ... } );
-    $lift->do( $job_sub, $callback_sub );
-    $lift->do( code=>$job_sub, callback=>$callback_sub );
-    $lift->do( %args );
+    $lift->do( $job_id, sub{ ... }, sub{ ... } );
+    $lift->do( \%job_args );
 
-Creates a new L</job_class> and passes it to L<Forklift::Scheduler/schedule_job>.
+Creates a new L</job_class> instance and passes it to
+L</schedule_job>.
 
-This method is the main entry point to running a job.
+This method is the main entry point to running a L<Forklift::Job>.
 
 =cut
 
 sub do {
     my $self = shift;
-    my $job = $self->job_class->new( @_ );
-    $self->scheduler->schedule_job( $job );
+
+    my $job;
+    if (@_==1 and ref($_[0]) eq 'HASH') {
+        $job = $self->job_class->new( @_ );
+    }
+    else {
+        my ($id, $code, $callback);
+        $code = shift;
+        ($id, $code) = ($code, shift) if ref($code) ne 'CODE';
+        $callback = shift;
+        $job = $self->job_class->new(
+            defined($id) ? (id=>$id) : (),
+            code => $code,
+            defined($callback) ? (callback=>$callback) : (),
+        );
+    }
+
+    $self->schedule_job( $job );
+
     return $job;
 }
 
@@ -233,9 +274,9 @@ Calling this gives the L</driver> and L</scheduler> a chance to do
 their jobs.  It is only necessary to call this method when there is
 a long run-time between job schedules (via L</do> or otherwise) and
 L</wait> calls.  Calling this is typically non-blocking, but it depends
-on the driver a bit.  For example, the C<::PFM> driver is completely
-not-blocking for yields, whie the C<::Basic> driver may block if there
-are queued jobs waiting to run.
+on the driver a bit.  For example, the C<::Parallel::ForkManager> driver
+is completely not-blocking for yields, while the C<::Basic> driver may
+block if there are queued jobs waiting to run.
 
 =cut
 
@@ -272,50 +313,40 @@ sub wait {
     return;
 }
 
-=head2 throw
-
-    $lift->throw();
-
-Looks in L<Forklift::Results/failed> and throws an exception for
-any failed results found.
-
-=cut
-
-sub throw {
-    my ($self) = @_;
-
-    my $results = $self->failed_results();
-    return if !@$results;
-
-    die join( "\n",
-        map { s{\s+$}{}r }
-        map { $_->status_message() }
-        @$results
-    );
-}
-
 1;
 __END__
 
-=head1 EXISTING PLUGINS
+=head1 PROXIED METHODS
 
-Available plugins include:
+=head2 schedule_job
 
-=over
+See L<Forklift::Scheduler/schedule_job>.
 
-=item *
+=head1 CUSTOMIZING
 
-L<ForkliftX::LogAny> - Logs whenever jobs start and finish using L<Log::Any>.
+See L<Forklift::Driver> for information on making your own drivers.
 
-=back
-
-=head2 WRITING PLUGINS
+See L<Forklift::Scheduler> for information on making your own schedulers.
 
 Forklift's plugin system uses L<MooX::PluginKit>.  See it's documentation for an
-overview, and see L</ForkliftX::LogAny> for a working example.
+overview, and see L</Forklift::Plugin::Log::Any> for a working example.  Plugins
+on CPAN are expected to exist in the C<Forklift::Plugin::> namespace.
 
-Plugins on CPAN are expected to exist in the C<ForkliftX::> namespace.  Only plugins
-should exist in this namespace.
+Generally new drivers, schedulers, and plugins will not be allowed into the core
+Forklift distribution unless that is a convincing reason to do so.  This is especially
+so if the new code would introduce new CPAN dependencies.
+
+Note that any new driver, scheduler, and plugin should at a minimum include a
+test which runs the entine L<Test::Forklift> test suite.  See the tests in this
+distribution for examples of how this works.  Even if your code won't exist on
+CPAN, running the generic Forklift tests against your customizations is highly
+encouraged.
+
+=head1 SUPPORT
+
+Feature requests, pull requests, and discussion can be had on GitHub at
+L<https://github.com/bluefeet/Forklift>.  You are also welcome to email
+the author directly.
 
 =head1 AUTHOR
 

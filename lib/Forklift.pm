@@ -177,7 +177,7 @@ sub _driver_build_args {
 
 An object which consumes the L<Forklift::Scheduler> role.  A hashref may
 be passed and will automatically be instantiated into a new object.  If the
-hashref hsa the C<class> key then that class will be used instead of
+hashref has the C<class> key then that class will be used instead of
 L<Forklift::Scheduler::Basic>.
 
 =cut
@@ -215,7 +215,7 @@ assumed to be relative to the C<Forklift::Plugin::> namespace.
 
     job_class => 'MyApp::CustomJob',
 
-The class to construct new job objects from.  Defaults to L<Forlift::Job>.
+The class to construct new job objects from.  Defaults to L<Forklift::Job>.
 
 =cut
 
@@ -227,7 +227,7 @@ has_pluggable_class job_class => (
 
     result_class => 'MyApp::CustomResult',
 
-The class to construct new result objects from.  Defaults to L<Forlift::Result>.
+The class to construct new result objects from.  Defaults to L<Forklift::Result>.
 
 =cut
 
